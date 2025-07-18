@@ -7,6 +7,7 @@ import numpy as np
 from matplotlib.patches import Ellipse
 from numba import njit, prange
 from numba import cuda
+import cupy
 
 import os
 use_rocm = os.getenv('ROCM_PATH') is not None
@@ -55,13 +56,10 @@ def model_disp(vq1, vq2, vq3):
     3d FM J=-1 meV S=1, en=6*S*J*(1-cos(Q))
     """
 
-    disp = np.zeros((2, len(vq1)), dtype=float)
-    disp_d = cuda.to_device(disp)
+    disp = cupy.zeros((2, len(vq1)))
     threads = 256
     blocks = (len(vq1) + (threads - 1)) // threads
-    _model_disp_kernel[blocks, threads](cuda.to_device(vq1),
-        cuda.to_device(vq2), cuda.to_device(vq3), disp_d)
-    disp_d.copy_to_host(disp)
+    _model_disp_kernel[blocks, threads](vq1, vq2, vq3, disp)
 
     return disp
 
@@ -79,13 +77,15 @@ def model_inten(vq1, vq2, vq3):
     """return intensity for given Q points
     3d FM J=-1 meV S=1, inten = S/2 for all Qs
     """
-    inten = np.ones_like(vq1, dtype=float) / 2
-    inten = np.array((inten, inten))
+    # inten = np.ones_like(vq1, dtype=float) / 2
+    # inten = np.array((inten, inten))
 
-    # reshape if only one band
-    num_inten = len(inten.shape)
-    if num_inten == 1:
-        inten = np.reshape(inten, (1, np.size(inten)))
+    # # reshape if only one band
+    # num_inten = len(inten.shape)
+    # if num_inten == 1:
+    #     inten = np.reshape(inten, (1, np.size(inten)))
+
+    inten = cupy.full((2, len(vq1)), 0.5)
 
     return inten
 
@@ -210,7 +210,6 @@ def _compute_weights_kernel(vqe, mat, wt):
 
     return
 
-import cupy
 def compute_weights(vqe: np.ndarray, mat: np.ndarray) -> np.ndarray:
     """calculate weiget
     vqe has shape (4, num_bands, num_pts)
@@ -218,9 +217,9 @@ def compute_weights(vqe: np.ndarray, mat: np.ndarray) -> np.ndarray:
     weights = np.einsum("ijk,il,ljk->jk", vqe, mat_qe, vqe)
     """
     # _, num_bands, num_pts = vqe.shape
-    vqe_d = cupy.asarray(vqe)
+    # vqe_d = cupy.asarray(vqe)
     mat_d = cupy.asarray(mat)
-    weights = cupy.asnumpy(cupy.einsum("ijk,il,ljk->jk", vqe_d, mat_d, vqe_d))
+    weights = cupy.einsum("ijk,il,ljk->jk", vqe, mat_d, vqe)
 
     # weights = np.zeros((num_bands, num_pts), dtype=float)
     # wt_d = cuda.to_device(weights)
@@ -236,10 +235,10 @@ def compute_weights(vqe: np.ndarray, mat: np.ndarray) -> np.ndarray:
 @functools.cache
 def generate_meshgrid(num_of_sigmas=3, num_pts=(10, 10, 10)):
     pts_qh, pts_qk, pts_ql = num_pts
-    qh = np.linspace(-num_of_sigmas, num_of_sigmas, pts_qh + 1)
-    qk = np.linspace(-num_of_sigmas, num_of_sigmas, pts_qk + 1)
-    ql = np.linspace(-num_of_sigmas, num_of_sigmas, pts_ql + 1)
-    return np.meshgrid(qh, qk, ql, indexing="ij")  # shape (3, N1, N2, N3)
+    qh = cupy.linspace(-num_of_sigmas, num_of_sigmas, pts_qh + 1)
+    qk = cupy.linspace(-num_of_sigmas, num_of_sigmas, pts_qk + 1)
+    ql = cupy.linspace(-num_of_sigmas, num_of_sigmas, pts_ql + 1)
+    return cupy.meshgrid(qh, qk, ql, indexing="ij")  # shape (3, N1, N2, N3)
 
 
 def generate_pts(sigma_qs, mat_hkl, num_of_sigmas=3, num_pts=(10, 10, 10)):
@@ -247,10 +246,14 @@ def generate_pts(sigma_qs, mat_hkl, num_of_sigmas=3, num_pts=(10, 10, 10)):
     (sigma_qh_incoh, sigma_qk_incoh, sigma_ql_incoh) = sigma_qs
 
     vq_h, vq_k, vq_l = generate_meshgrid(num_of_sigmas, num_pts)
-    vq = (vq_h * sigma_qh_incoh, vq_k * sigma_qk_incoh, vq_l * sigma_ql_incoh)
+    # vq = (vq_h * sigma_qh_incoh, vq_k * sigma_qk_incoh, vq_l * sigma_ql_incoh)
+    vq = cupy.ndarray((3, vq_h.shape[0], vq_h.shape[1], vq_h.shape[2]))
+    vq[0] = vq_h * sigma_qh_incoh
+    vq[1] = vq_k * sigma_qk_incoh
+    vq[2] = vq_l * sigma_ql_incoh
 
     # -------- cut the corners based on distance --------
-    r_sq = np.einsum("i...,ij,j...->...", vq, mat_hkl, vq)
+    r_sq = cupy.einsum("i...,ij,j...->...", vq, cupy.asarray(mat_hkl), vq)
     idx = r_sq < num_of_sigmas**2  # Ellipsoid mask
     return (vq[0][idx], vq[1][idx], vq[2][idx]), idx
 
@@ -314,20 +317,22 @@ def convolution(reso_params, energy_rez_factor=1 / 5, max_step=100):
     # ----------------------------------------------------
     # determine if sampled enough based on steps along energy
     # ----------------------------------------------------
-    vq = np.array((vqh, vqk, vql))  # shape: (3, num_pts)
-    vqe = np.empty((4, num_bands, num_pts))
+    vq = cupy.array((vqh, vqk, vql))  # shape: (3, num_pts)
+    vqe = cupy.empty((4, num_bands, num_pts))
     vqe[0:3] = vq[:, None, :]
     vqe[3] = disp - en
     weights = compute_weights(vqe, mat)  # shape: (num_bands, num_pts)
     # Return zero if everything is outside the 5-sigma volume
-    if np.min(weights) > 5**3:
+    if cupy.min(weights) > 5**3:
         return 0.0
 
     # ----------------------------------------------------
     # determine Q steps based on energy steps
     # ----------------------------------------------------
     disp_arr = np.full(shape=(num_bands,) + idx.shape, fill_value=np.nan)
-    disp_arr[(slice(None),) + np.nonzero(idx)] = disp
+    disp_h = cupy.asnumpy(disp)
+    idx_h = cupy.asnumpy(idx)
+    disp_arr[(slice(None),) + np.nonzero(idx_h)] = disp_h
     # Compute max energy steps
     steps = [get_max_step(disp_arr, axis=i) for i in (1, 2, 3)]
     # limit the maximum in case the dispersion is too steep
@@ -343,8 +348,8 @@ def convolution(reso_params, energy_rez_factor=1 / 5, max_step=100):
     disp = model_disp(vqh + qh, vqk + qk, vql + ql)
     _, num_pts = disp.shape
 
-    vq = np.array((vqh, vqk, vql))  # shape: (3, num_pts)
-    vqe = np.empty((4, num_bands, num_pts))
+    vq = cupy.array((vqh, vqk, vql))  # shape: (3, num_pts)
+    vqe = cupy.empty((4, num_bands, num_pts))
     vqe[0:3] = vq[:, None, :]
     vqe[3] = disp - en
 
@@ -358,13 +363,13 @@ def convolution(reso_params, energy_rez_factor=1 / 5, max_step=100):
     percent_kep = num_pts_keep / np.prod(pts) * 100
     print(f"Number of pts inside the ellipsoid = {num_pts_keep}, percentage ={percent_kep:.3f}%")
 
-    weights_filtered = np.exp(-weights[:, idx_keep] / 2)
+    weights_filtered = cupy.exp(-weights[:, idx_keep] / 2)
     inten = model_inten(*vq_filtered)
     # normalization by elementary volume size
     elem_vols /= np.prod(pts)
     det = np.linalg.det(mat)
-    inten_sum = np.sum(inten * weights_filtered) * elem_vols
-    return r0 * inten_sum * np.sqrt(det) / (2 * np.pi) ** 2
+    inten_sum = cupy.sum(inten * weights_filtered) * elem_vols
+    return cupy.asnumpy(r0 * inten_sum * np.sqrt(det) / (2 * np.pi) ** 2)
 
 
 if __name__ == "__main__":
@@ -417,7 +422,7 @@ if __name__ == "__main__":
     ax.set_ylim((en_min, en_max))
 
     plot_rez_ellipses(ax)
-    disp = model_disp(q1, np.zeros_like(q1), np.zeros_like(q1))
+    disp = cupy.asnumpy(model_disp(q1, np.zeros_like(q1), np.zeros_like(q1)))
     for i in range(np.shape(disp)[0]):
         ax.plot(q1, disp[i], "-w")
 
