@@ -42,7 +42,7 @@ def _model_disp_kernel(vq1, vq2, vq3, disp):
     if i >= len(vq1):
         return
     sj = 5
-    twopi = 2 * pi
+    twopi = 2 * np.pi
     gamma_q = (cos(twopi * vq1[i]) + cos(twopi * vq2[i]) + cos(twopi * vq3[i])) / 3
 
     d = 2 * sj * (1 - gamma_q)
@@ -55,29 +55,25 @@ def model_disp(vq1, vq2, vq3):
     3d FM J=-1 meV S=1, en=6*S*J*(1-cos(Q))
     """
 
-    sj = 5
-    # gamma_q = np.cos(2 * np.pi * vq1)
-    gamma_q = (np.cos(2 * np.pi * vq1) + np.cos(2 * np.pi * vq2) + np.cos(2 * np.pi * vq3)) / 3
-
-    disp = 2 * sj * (1 - gamma_q)
-    disp = np.array((disp - 2, disp + 2))
-
-    # reshape if only one band
-    num_disp = len(disp.shape)
-    if num_disp == 1:
-        disp = np.reshape(disp, (1, np.size(disp)))
-
-    disp_h = np.zeros((2, len(vq1)), dtype=float)
-    disp_d = cuda.to_device(disp_h)
+    disp = np.zeros((2, len(vq1)), dtype=float)
+    disp_d = cuda.to_device(disp)
     threads = 256
-    blocks = (len(path) + (threads - 1)) // threads
+    blocks = (len(vq1) + (threads - 1)) // threads
     _model_disp_kernel[blocks, threads](cuda.to_device(vq1),
         cuda.to_device(vq2), cuda.to_device(vq3), disp_d)
-    disp_d.copy_to_host(disp_h)
-    print("disp err: ", np.norm(disp - disp_h))
+    disp_d.copy_to_host(disp)
 
     return disp
 
+
+@cuda.jit
+def _model_inten_kernel(vq1, inten):
+    i = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
+    if i >= len(vq1):
+        return
+    inten[0, i] = 1./2.
+    inten[1, i] = 1./2.
+    return
 
 def model_inten(vq1, vq2, vq3):
     """return intensity for given Q points
@@ -198,24 +194,41 @@ def coh_sigma(mat: np.ndarray, axis: int):
     return 1 / np.sqrt(np.abs(mat[idx, idx]))
 
 
-@njit(parallel=True, nogil=True)
+@cuda.jit
+def _compute_weights_kernel(vqe, mat, wt):
+    i = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
+    if i >= vqe.shape[2]:
+        return
+
+    for b in range(vqe.shape[1]):
+        v = vqe[:, b, i]
+        tmp = 0.0
+        for k in range(4):
+            for l in range(4):
+                tmp += v[k] * mat[k, l] * v[l]
+        wt[b, i] = tmp
+
+    return
+
+import cupy
 def compute_weights(vqe: np.ndarray, mat: np.ndarray) -> np.ndarray:
     """calculate weiget
     vqe has shape (4, num_bands, num_pts)
     mat has shape (4, 4)
     weights = np.einsum("ijk,il,ljk->jk", vqe, mat_qe, vqe)
     """
-    _, num_bands, num_pts = vqe.shape
-    weights = np.empty((num_bands, num_pts))
+    # _, num_bands, num_pts = vqe.shape
+    vqe_d = cupy.asarray(vqe)
+    mat_d = cupy.asarray(mat)
+    weights = cupy.asnumpy(cupy.einsum("ijk,il,ljk->jk", vqe_d, mat_d, vqe_d))
 
-    for i in prange(num_bands):
-        for j in range(num_pts):
-            v = vqe[:, i, j]  # shape: (4,)
-            tmp = 0.0
-            for k in range(4):
-                for l in range(4):
-                    tmp += v[k] * mat[k, l] * v[l]
-            weights[i, j] = tmp
+    # weights = np.zeros((num_bands, num_pts), dtype=float)
+    # wt_d = cuda.to_device(weights)
+    # threads = 256
+    # blocks = (num_pts + (threads - 1)) // threads
+    # _compute_weights_kernel[blocks, threads](cuda.to_device(vqe),
+    #     cuda.to_device(mat), wt_d)
+    # wt_d.copy_to_host(weights)
 
     return weights
 
@@ -375,15 +388,15 @@ if __name__ == "__main__":
 
     t0 = time()
     # ------------------- multiprocessing ------------------
-    num_worker = 8
-    with ProcessPoolExecutor(max_workers=num_worker) as executor:
-        results = executor.map(convolution, reso_params)
-    measurement_inten = np.asarray(list(results))
+    # num_worker = 1
+    # with ProcessPoolExecutor(max_workers=num_worker) as executor:
+    #     results = executor.map(convolution, reso_params)
+    # measurement_inten = np.asarray(list(results))
     # ------------------- single core ------------------
-    # sz = len(reso_params)
-    # measurement_inten = np.empty(shape=sz)
-    # for i in range(sz):
-    #     measurement_inten[i] = convolution(reso_params[i])
+    sz = len(reso_params)
+    measurement_inten = np.empty(shape=sz)
+    for i in range(sz):
+        measurement_inten[i] = convolution(reso_params[i])
     # --------------------------------------------------
 
     print(f"Convolution completed in {(t1 := time()) - t0:.4f} s")
