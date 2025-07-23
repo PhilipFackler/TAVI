@@ -32,61 +32,44 @@ if use_rocm:
 else:
     from numba.cuda.libdevice import cos, exp, rsqrt, sin, sincospi, sqrt
 
+from phonopy import load
+
+class model_info:
+    def __init__(self):
+        self.phonon = load('phonopy.yaml')
+        self.mesh = [11, 11, 11]
+        self.phonon.run_mesh(self.mesh, is_mesh_symmetry=False, with_eigenvectors=True)
+        self.scattering_lengths = {'Ge': 8.185}
+        self.temperature = 300
+        self.cutoff = 8e-2
+
+def init_model():
+    global data
+    data = model_info()
 
 # -------------------------------------------------------
 # user input model_disp and model_inten
 # -------------------------------------------------------
-@cuda.jit
-def _model_disp_kernel(vq1, vq2, vq3, disp):
-    i = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
-    if i >= len(vq1):
-        return
-    sj = 5
-    twopi = 2 * np.pi
-    gamma_q = (cos(twopi * vq1[i]) + cos(twopi * vq2[i]) + cos(twopi * vq3[i])) / 3
-
-    d = 2 * sj * (1 - gamma_q)
-    disp[0, i] = d - 2
-    disp[1, i] = d + 2
-    return
-
-def model_disp(vq1, vq2, vq3):
+def model_disp(vq1, vq2, vq3, data):
     """return energy for given Q points
-    3d FM J=-1 meV S=1, en=6*S*J*(1-cos(Q))
     """
 
-    disp = cupy.zeros((2, len(vq1)))
-    threads = 256
-    blocks = (len(vq1) + (threads - 1)) // threads
-    _model_disp_kernel[blocks, threads](vq1, vq2, vq3, disp)
+    Qpoints = np.column_stack([vq1,vq2,vq3])
+    Q_prim = np.dot(Qpoints, data.phonon.primitive_matrix)
+    data.phonon.run_qpoints(Q_prim, with_eigenvectors=False)
+    band_dict = data.phonon.get_qpoints_dict()
+    return np.transpose(band_dict['frequencies'])
 
-    return disp
 
-
-@cuda.jit
-def _model_inten_kernel(vq1, inten):
-    i = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
-    if i >= len(vq1):
-        return
-    inten[0, i] = 1./2.
-    inten[1, i] = 1./2.
-    return
-
-def model_inten(vq1, vq2, vq3):
+def model_inten(vq1, vq2, vq3, data):
     """return intensity for given Q points
-    3d FM J=-1 meV S=1, inten = S/2 for all Qs
     """
-    # inten = np.ones_like(vq1, dtype=float) / 2
-    # inten = np.array((inten, inten))
-
-    # # reshape if only one band
-    # num_inten = len(inten.shape)
-    # if num_inten == 1:
-    #     inten = np.reshape(inten, (1, np.size(inten)))
-
-    inten = cupy.full((2, len(vq1)), 0.5)
-
-    return inten
+    Qpoints = np.column_stack([vq1,vq2,vq3])
+    Q_prim = np.dot(Qpoints, data.phonon.primitive_matrix)
+    data.phonon.run_dynamic_structure_factor(Q_prim, data.temperature,
+    scattering_lengths=data.scattering_lengths, freq_min=data.cutoff)
+    dsf = data.phonon.dynamic_structure_factor
+    return np.transpose(dsf.dynamic_structure_factors)
 
 
 # -------------------------------------------------------
@@ -192,7 +175,6 @@ def coh_sigma(mat: np.ndarray, axis: int):
 
     return 1 / np.sqrt(np.abs(mat[idx, idx]))
 
-
 @cuda.jit
 def _compute_weights_kernel(vqe, mat, wt):
     i = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
@@ -210,23 +192,13 @@ def _compute_weights_kernel(vqe, mat, wt):
     return
 
 def compute_weights(vqe: np.ndarray, mat: np.ndarray) -> np.ndarray:
-    """calculate weiget
+    """calculate weight
     vqe has shape (4, num_bands, num_pts)
     mat has shape (4, 4)
     weights = np.einsum("ijk,il,ljk->jk", vqe, mat_qe, vqe)
     """
-    # _, num_bands, num_pts = vqe.shape
-    # vqe_d = cupy.asarray(vqe)
     mat_d = cupy.asarray(mat)
     weights = cupy.einsum("ijk,il,ljk->jk", vqe, mat_d, vqe)
-
-    # weights = np.zeros((num_bands, num_pts), dtype=float)
-    # wt_d = cuda.to_device(weights)
-    # threads = 256
-    # blocks = (num_pts + (threads - 1)) // threads
-    # _compute_weights_kernel[blocks, threads](cuda.to_device(vqe),
-    #     cuda.to_device(mat), wt_d)
-    # wt_d.copy_to_host(weights)
 
     return weights
 
@@ -245,7 +217,6 @@ def generate_pts(sigma_qs, mat_hkl, num_of_sigmas=3, num_pts=(10, 10, 10)):
     (sigma_qh_incoh, sigma_qk_incoh, sigma_ql_incoh) = sigma_qs
 
     vq_h, vq_k, vq_l = generate_meshgrid(num_of_sigmas, num_pts)
-    # vq = (vq_h * sigma_qh_incoh, vq_k * sigma_qk_incoh, vq_l * sigma_ql_incoh)
     vq = cupy.ndarray((3, vq_h.shape[0], vq_h.shape[1], vq_h.shape[2]))
     vq[0] = vq_h * sigma_qh_incoh
     vq[1] = vq_k * sigma_qk_incoh
@@ -268,7 +239,7 @@ def get_max_step(arr, axis: int):
     return float(np.nanmax(steps))
 
 
-def convolution(reso_params, energy_rez_factor=1 / 5, max_step=100):
+def convolution(reso_params, data, energy_rez_factor=1 / 5, max_step=100):
     """Perform the convolution
     The maxium sampling box size in Q is (max_step, max_step ,max_step)
 
@@ -307,8 +278,7 @@ def convolution(reso_params, energy_rez_factor=1 / 5, max_step=100):
     # ----------------------------------------------------
     pts = [10, 10, 10]
     (vqh, vqk, vql), idx = generate_pts(sigma_qs, mat_hkl, num_of_sigmas, tuple(pts))
-    # disp = model_disp(vqh + qh, vqk + qk, vql + ql)
-    disp = model_disp(vqh + qh, vqk + qk, vql + ql)
+    disp = model_disp(vqh + qh, vqk + qk, vql + ql, data)
     num_bands, num_pts = disp.shape
 
     # Retrun zero if all dispersion is outside the relevant energy window
@@ -345,8 +315,7 @@ def convolution(reso_params, energy_rez_factor=1 / 5, max_step=100):
     # Enough sampled. Calculate weight from resolution function
     # ----------------------------------------------------
     (vqh, vqk, vql), idx = generate_pts(sigma_qs, mat_hkl, num_of_sigmas, tuple(pts))
-    # disp = model_disp(vqh + qh, vqk + qk, vql + ql)
-    disp = model_disp(vqh + qh, vqk + qk, vql + ql)
+    disp = model_disp(vqh + qh, vqk + qk, vql + ql, data)
     _, num_pts = disp.shape
 
     vq = cupy.array((vqh, vqk, vql))  # shape: (3, num_pts)
@@ -365,7 +334,7 @@ def convolution(reso_params, energy_rez_factor=1 / 5, max_step=100):
     print(f"Number of pts inside the ellipsoid = {num_pts_keep}, percentage ={percent_kep:.3f}%")
 
     weights_filtered = cupy.exp(-weights[:, idx_keep] / 2)
-    inten = model_inten(*vq_filtered)
+    inten = model_inten(*vq_filtered, data)
     # normalization by elementary volume size
     elem_vols /= np.prod(pts)
     det = np.linalg.det(mat)
@@ -379,10 +348,8 @@ if __name__ == "__main__":
     # qe_mesh has the dimension (4, n_pts_of_measurement)
     # flatten for meshed measurement
     # ----------------------------------------------------
-    # q1_min, q1_max, q1_step = 2, 2.02, 0.02
-    # en_min, en_max, en_step = 1, 2, 1.0
-    q1_min, q1_max, q1_step = 2, 3, 0.02
-    en_min, en_max, en_step = -3, 25, 0.5
+    q1_min, q1_max, q1_step = 2, 2.02, 0.02
+    en_min, en_max, en_step = 1, 2, 1.0
     q2 = 0
     q3 = 0
 
@@ -394,17 +361,20 @@ if __name__ == "__main__":
     q_list = np.stack((vq1.ravel(), vq2.ravel(), vq3.ravel()), axis=-1)
     reso_params = resolution_matrix(hkl=q_list, en=en)
 
+    #data = model_info()
+
     t0 = time()
     # ------------------- multiprocessing ------------------
-    # num_worker = 1
-    # with ProcessPoolExecutor(max_workers=num_worker) as executor:
-    #     results = executor.map(convolution, reso_params)
-    # measurement_inten = np.asarray(list(results))
+    #num_worker = 8
+    #with ProcessPoolExecutor(max_workers=num_worker, initializer=init_model) as executor:
+    #    results = executor.map(convolution, reso_params)
+    #measurement_inten = np.asarray(list(results))
     # ------------------- single core ------------------
+    data = model_info()
     sz = len(reso_params)
     measurement_inten = np.empty(shape=sz)
     for i in range(sz):
-        measurement_inten[i] = convolution(reso_params[i])
+        measurement_inten[i] = convolution(reso_params[i], data)
     # --------------------------------------------------
 
     print(f"Convolution completed in {(t1 := time()) - t0:.4f} s")
