@@ -7,8 +7,10 @@ import numpy as np
 from matplotlib.patches import Ellipse
 from numba import cuda
 import cupy
+cupy.cuda.runtime.setDevice(1)
 
 import os
+from os.path import dirname, realpath
 use_rocm = os.getenv('ROCM_PATH') is not None
 
 import numba
@@ -34,12 +36,13 @@ else:
 
 from phonopy import load
 
+import phonopyacc
+
 class model_info:
     def __init__(self):
-        self.phonon = load('phonopy.yaml')
+        filename = dirname(realpath(__file__)) + "/phonopy.yaml"
         self.mesh = [11, 11, 11]
-        self.phonon.run_mesh(self.mesh, is_mesh_symmetry=False, with_eigenvectors=True)
-        self.scattering_lengths = {'Ge': 8.185}
+        self.intens_data = phonopyacc.IntensitiesData(filename, self.mesh)
         self.temperature = 300
         self.cutoff = 8e-2
 
@@ -53,23 +56,19 @@ def init_model():
 def model_disp(vq1, vq2, vq3, data):
     """return energy for given Q points
     """
-
-    Qpoints = np.column_stack([vq1,vq2,vq3])
-    Q_prim = np.dot(Qpoints, data.phonon.primitive_matrix)
-    data.phonon.run_qpoints(Q_prim, with_eigenvectors=False)
-    band_dict = data.phonon.get_qpoints_dict()
-    return np.transpose(band_dict['frequencies'])
+    Q_prim = cupy.dot(cupy.column_stack([vq1,vq2,vq3]),
+        cupy.asarray(data.intens_data.phonon.primitive_matrix))
+    freqs = data.intens_data.calc_run_qpoints_frequencies(Q_prim)
+    return cupy.transpose(cupy.asarray(freqs))
 
 
 def model_inten(vq1, vq2, vq3, data):
     """return intensity for given Q points
     """
-    Qpoints = np.column_stack([vq1,vq2,vq3])
-    Q_prim = np.dot(Qpoints, data.phonon.primitive_matrix)
-    data.phonon.run_dynamic_structure_factor(Q_prim, data.temperature,
-    scattering_lengths=data.scattering_lengths, freq_min=data.cutoff)
-    dsf = data.phonon.dynamic_structure_factor
-    return np.transpose(dsf.dynamic_structure_factors)
+    Q_prim = cupy.dot(cupy.column_stack([vq1,vq2,vq3]),
+        cupy.asarray(data.intens_data.phonon.primitive_matrix))
+    _, dsf = data.intens_data.calc_intensities(Q_prim, data.temperature, data.cutoff)
+    return cupy.transpose(dsf)
 
 
 # -------------------------------------------------------
@@ -396,7 +395,7 @@ if __name__ == "__main__":
 
     plot_rez_ellipses(ax)
     disp = cupy.asnumpy(model_disp(cupy.asarray(q1), cupy.zeros_like(q1),
-        cupy.zeros_like(q1)))
+        cupy.zeros_like(q1), data))
     for i in range(np.shape(disp)[0]):
         ax.plot(q1, disp[i], "-w")
 

@@ -7,20 +7,13 @@ import numpy as np
 from matplotlib.patches import Ellipse
 from numba import njit, prange
 
+from os.path import dirname, realpath
 from phonopy import load
-#phonon = load('phonopy.yaml')
-# This is for phonon calculations
-#mesh = [11, 11, 11]  # Sampling mesh in the first BZ for Debye-Waller factor calculation
-#scattering_lengths = {'Ge': 8.185}
-#temperature = 300
-#cutoff = 8e-2
-#phonon.run_mesh(mesh,
-#                is_mesh_symmetry=False, # symmetry must be off
-#                with_eigenvectors=True) # eigenvectors must be true
 
 class model_info:
     def __init__(self):
-        self.phonon = load('phonopy.yaml')
+        self.filename = dirname(realpath(__file__)) + "/phonopy.yaml"
+        self.phonon = load(self.filename)
         self.mesh = [11, 11, 11]
         self.phonon.run_mesh(self.mesh, is_mesh_symmetry=False, with_eigenvectors=True)
         self.scattering_lengths = {'Ge': 8.185}
@@ -28,8 +21,8 @@ class model_info:
         self.cutoff = 8e-2
 
 def init_model():
-    global data
-    data = model_info()
+    global model_data
+    model_data = model_info()
 
 # -------------------------------------------------------
 # user input model_disp and model_inten
@@ -215,7 +208,7 @@ def get_max_step(arr, axis: int):
     return float(np.nanmax(steps))
 
 
-def convolution(reso_params, data, energy_rez_factor=1 / 5, max_step=100):
+def convolution(reso_params, energy_rez_factor=1 / 5, max_step=100):
     """Perform the convolution
     The maxium sampling box size in Q is (max_step, max_step ,max_step)
 
@@ -227,6 +220,9 @@ def convolution(reso_params, data, energy_rez_factor=1 / 5, max_step=100):
     # ----------------------------------------------------
     if reso_params is None:
         return np.nan
+
+    global model_data
+    data = model_data
     # ----------------------------------------------------
     # calculate resolution matrix for all points
     # ----------------------------------------------------
@@ -339,16 +335,16 @@ if __name__ == "__main__":
 
     t0 = time()
     # ------------------- multiprocessing ------------------
-    #num_worker = 8
-    #with ProcessPoolExecutor(max_workers=num_worker, initializer=init_model) as executor:
-    #    results = executor.map(convolution, reso_params)
-    #measurement_inten = np.asarray(list(results))
+    num_worker = 8
+    with ProcessPoolExecutor(max_workers=num_worker, initializer=init_model) as executor:
+        results = executor.map(convolution, reso_params)
+    measurement_inten = np.asarray(list(results))
     # ------------------- single core ------------------
-    data = model_info()
-    sz = len(reso_params)
-    measurement_inten = np.empty(shape=sz)
-    for i in range(sz):
-        measurement_inten[i] = convolution(reso_params[i], data)
+    # init_model()
+    # sz = len(reso_params)
+    # measurement_inten = np.empty(shape=sz)
+    # for i in range(sz):
+    #     measurement_inten[i] = convolution(reso_params[i])
     # --------------------------------------------------
 
     print(f"Convolution completed in {(t1 := time()) - t0:.4f} s")
@@ -369,7 +365,8 @@ if __name__ == "__main__":
     ax.set_ylim((en_min, en_max))
 
     plot_rez_ellipses(ax)
-    disp = model_disp(q1, np.zeros_like(q1), np.zeros_like(q1), data)
+    global model_data
+    disp = model_disp(q1, np.zeros_like(q1), np.zeros_like(q1), model_data)
     for i in range(np.shape(disp)[0]):
         ax.plot(q1, disp[i], "-w")
 
