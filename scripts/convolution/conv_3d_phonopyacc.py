@@ -7,6 +7,7 @@ import numpy as np
 from matplotlib.patches import Ellipse
 from numba import cuda
 import cupy
+from math import ceil
 cupy.cuda.runtime.setDevice(1)
 
 import os
@@ -202,30 +203,63 @@ def compute_weights(vqe: np.ndarray, mat: np.ndarray) -> np.ndarray:
     return weights
 
 
-@functools.cache
-def generate_meshgrid(num_of_sigmas=3, num_pts=(10, 10, 10)):
-    pts_qh, pts_qk, pts_ql = num_pts
-    qh = cupy.linspace(-num_of_sigmas, num_of_sigmas, pts_qh + 1)
-    qk = cupy.linspace(-num_of_sigmas, num_of_sigmas, pts_qk + 1)
-    ql = cupy.linspace(-num_of_sigmas, num_of_sigmas, pts_ql + 1)
-    return cupy.meshgrid(qh, qk, ql, indexing="ij")  # shape (3, N1, N2, N3)
+# @functools.cache
+# def generate_meshgrid(num_of_sigmas=3, num_pts=(10, 10, 10)):
+#     pts_qh, pts_qk, pts_ql = num_pts
+#     qh = cupy.linspace(-num_of_sigmas, num_of_sigmas, pts_qh + 1)
+#     qk = cupy.linspace(-num_of_sigmas, num_of_sigmas, pts_qk + 1)
+#     ql = cupy.linspace(-num_of_sigmas, num_of_sigmas, pts_ql + 1)
+#     return cupy.meshgrid(qh, qk, ql, indexing="ij")  # shape (3, N1, N2, N3)
 
 
-def generate_pts(sigma_qs, mat_hkl, num_of_sigmas=3, num_pts=(10, 10, 10)):
+# def generate_pts(sigma_qs, mat_hkl, num_of_sigmas=3, num_pts=(10, 10, 10)):
+#     """Generate points in a 3D mesh, cut the points at the corners"""
+#     (sigma_qh_incoh, sigma_qk_incoh, sigma_ql_incoh) = sigma_qs
+
+#     vq_h, vq_k, vq_l = generate_meshgrid(num_of_sigmas, num_pts)
+#     vq = cupy.ndarray((3, vq_h.shape[0], vq_h.shape[1], vq_h.shape[2]))
+#     vq[0] = vq_h * sigma_qh_incoh
+#     vq[1] = vq_k * sigma_qk_incoh
+#     vq[2] = vq_l * sigma_ql_incoh
+
+#     # -------- cut the corners based on distance --------
+#     r_sq = cupy.einsum("i...,ij,j...->...", vq, cupy.asarray(mat_hkl), vq)
+#     idx = r_sq < num_of_sigmas**2  # Ellipsoid mask
+#     return (vq[0][idx], vq[1][idx], vq[2][idx]), idx
+
+@cuda.jit
+def _gen_pts_kernel(vq, n_sigmas, Nh, Nk, Nl, s_qh, s_qk, s_ql):
+    i = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
+    j = cuda.blockIdx.y * cuda.blockDim.y + cuda.threadIdx.y
+    k = cuda.blockIdx.z * cuda.blockDim.z + cuda.threadIdx.z
+    if i >= Nh or j >= Nk or k >= Nl:
+        return
+
+    a = -n_sigmas
+    b = n_sigmas
+    dh = (b - a) / (Nh - 1)
+    dk = (b - a) / (Nk - 1)
+    dl = (b - a) / (Nl - 1)
+    vq[0,i,j,k] = (i*dh + a) * s_qh
+    vq[1,i,j,k] = (j*dk + a) * s_qk
+    vq[2,i,j,k] = (k*dl + a) * s_ql
+
+    return
+
+def generate_pts(sigma_qs, mat_hkl, n_sigmas, num_pts):
     """Generate points in a 3D mesh, cut the points at the corners"""
-    (sigma_qh_incoh, sigma_qk_incoh, sigma_ql_incoh) = sigma_qs
-
-    vq_h, vq_k, vq_l = generate_meshgrid(num_of_sigmas, num_pts)
-    vq = cupy.ndarray((3, vq_h.shape[0], vq_h.shape[1], vq_h.shape[2]))
-    vq[0] = vq_h * sigma_qh_incoh
-    vq[1] = vq_k * sigma_qk_incoh
-    vq[2] = vq_l * sigma_ql_incoh
+    L, M, N = (num_pts[0] + 1, num_pts[1] + 1, num_pts[2] + 1)
+    vq = cupy.array([cupy.empty((L, M, N)), cupy.empty((L, M, N)),
+        cupy.empty((L, M, N))])
+    threads = (8, 8, 8)
+    blocks = (ceil(L / 8), ceil(M / 8), ceil(N / 8))
+    s_qh, s_qk, s_ql = sigma_qs
+    _gen_pts_kernel[blocks, threads](vq, n_sigmas, L, M, N, s_qh, s_qk, s_ql)
 
     # -------- cut the corners based on distance --------
     r_sq = cupy.einsum("i...,ij,j...->...", vq, cupy.asarray(mat_hkl), vq)
-    idx = r_sq < num_of_sigmas**2  # Ellipsoid mask
+    idx = r_sq < n_sigmas**2  # Ellipsoid mask
     return (vq[0][idx], vq[1][idx], vq[2][idx]), idx
-
 
 def get_max_step(arr, axis: int):
     """Get max step along a given axis. Return zero if all NaN"""
